@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""
+UK Mortgage Feed Scraper — This is Money
+For: bestmortgagesforyou.co.uk
+Output: feeds/thisismoney_mortgage.xml
+"""
+
+import feedparser
+import requests
+import hashlib
+import json
+import os
+import re
+import time
+from datetime import datetime
+from email.utils import formatdate
+from bs4 import BeautifulSoup
+from xml.etree.ElementTree import Element, SubElement, tostring
+from xml.dom import minidom
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+
+SOURCE_RSS       = "https://www.thisismoney.co.uk/money/mortgages/index.rss"
+
+FEED_TITLE       = "Best Mortgages For You – This is Money Updates"
+FEED_LINK        = "https://bestmortgagesforyou.co.uk"
+FEED_DESC        = "Latest UK mortgage and housing finance news, sourced and rewritten daily."
+FEED_LANG        = "en-gb"
+
+# GitHub Actions: relative paths
+OUTPUT_PATH      = "feeds/thisismoney_mortgage.xml"
+HASH_FILE        = "feeds/.seen_thisismoney.json"
+
+MAX_ITEMS        = 20
+MAX_NEW_PER_RUN  = 5
+
+# API key from GitHub Secret (set via env var in workflow)
+OPENROUTER_KEY   = os.environ.get("OPENROUTER_KEY", "")
+OPENROUTER_MODEL = "deepseek/deepseek-chat"
+OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
+
+AUTHORS = [
+    "Bambang Setiawan",
+    "Nadya Putri Maharani",
+    "Rizky Aditya Pratama",
+    "Sri Wahyuni Astuti",
+]
+
+SITE_BASE_URL = "https://bestmortgagesforyou.co.uk"
+
+# ─── LOGGING ──────────────────────────────────────────────────────────────────
+
+def log(msg: str):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+# ─── DEDUPLICATION ────────────────────────────────────────────────────────────
+
+def load_seen() -> dict:
+    if os.path.exists(HASH_FILE):
+        with open(HASH_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_seen(seen: dict):
+    with open(HASH_FILE, "w") as f:
+        json.dump(seen, f, indent=2)
+
+def url_hash(url: str) -> str:
+    return hashlib.md5(url.encode()).hexdigest()
+
+# ─── ARTICLE FETCH ────────────────────────────────────────────────────────────
+
+def fetch_article_body(url: str) -> str:
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+
+        selectors = [
+            {"class": "article-text"},
+            {"itemprop": "articleBody"},
+            {"class": "mol-article-body"},
+            "article",
+        ]
+        body = None
+        for sel in selectors:
+            if isinstance(sel, dict):
+                body = soup.find("div", sel)
+            else:
+                body = soup.find(sel)
+            if body:
+                break
+
+        if not body:
+            return ""
+
+        for tag in body.find_all(["aside", "script", "style", "figure",
+                                   "figcaption", "iframe", "ins"]):
+            tag.decompose()
+
+        return body.get_text(separator=" ", strip=True)[:2500]
+
+    except Exception as e:
+        log(f"  [fetch error] {e}")
+        return ""
+
+# ─── REWRITER ─────────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are a UK personal finance journalist writing for bestmortgagesforyou.co.uk.
+
+Rules:
+- British English only (colour, favour, realise, whilst, etc.)
+- Tone: informative, clear, FCA-safe — never give direct financial advice
+- Avoid "you should" — use "homeowners may wish to", "it could be worth", "borrowers might consider"
+- Structure: opening paragraph → 2 or 3 H2 sections → short closing paragraph
+- Output ONLY the HTML article body. No markdown. No preamble. No explanation.
+- Tags to use: <h2>, <p>, <ul>, <li>
+- Length: 500–650 words
+- Do NOT copy sentences from the source. Rewrite completely in your own words."""
+
+def rewrite(title: str, body: str, author: str):
+    user_prompt = (
+        f"Rewrite the following UK mortgage/finance news story as a fresh, original article "
+        f"for bestmortgagesforyou.co.uk. British English throughout.\n\n"
+        f"Original headline: {title}\n\n"
+        f"Source content:\n{body}\n\n"
+        f"Begin the article with: <p class=\"author\">By {author}</p>"
+    )
+    try:
+        r = requests.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": SITE_BASE_URL,
+                "X-Title": "Best Mortgages For You",
+            },
+            json={
+                "model": OPENROUTER_MODEL,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                "max_tokens": 1200,
+                "temperature": 0.72,
+            },
+            timeout=60,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log(f"  [openrouter error] {e}")
+        return None
+
+# ─── XML BUILDER ──────────────────────────────────────────────────────────────
+
+def slugify(text: str) -> str:
+    s = text.lower()
+    s = re.sub(r"[^a-z0-9\s-]", "", s)
+    s = re.sub(r"\s+", "-", s.strip())
+    return s[:60].rstrip("-")
+
+def load_existing_items() -> list:
+    if not os.path.exists(OUTPUT_PATH):
+        return []
+    try:
+        with open(OUTPUT_PATH, "r", encoding="utf-8") as f:
+            raw = f.read()
+        parsed = feedparser.parse(raw)
+        items = []
+        for e in parsed.entries:
+            tags = [t.term for t in e.get("tags", [])]
+            items.append({
+                "title":      e.get("title", ""),
+                "link":       e.get("link", ""),
+                "guid":       e.get("id", e.get("link", "")),
+                "pubDate":    e.get("published", formatdate(localtime=False)),
+                "content":    e.get("summary", ""),
+                "author":     e.get("author", AUTHORS[0]),
+                "categories": tags,
+            })
+        return items
+    except Exception as e:
+        log(f"  [load existing error] {e}")
+        return []
+
+def build_xml(items: list) -> str:
+    rss = Element("rss")
+    rss.set("version", "2.0")
+    rss.set("xmlns:content", "http://purl.org/rss/1.0/modules/content/")
+    rss.set("xmlns:media",   "http://search.yahoo.com/mrss/")
+    rss.set("xmlns:atom",    "http://www.w3.org/2005/Atom")
+
+    channel = SubElement(rss, "channel")
+    SubElement(channel, "title").text        = FEED_TITLE
+    SubElement(channel, "link").text         = FEED_LINK
+    SubElement(channel, "description").text  = FEED_DESC
+    SubElement(channel, "language").text     = FEED_LANG
+    SubElement(channel, "lastBuildDate").text = formatdate(localtime=False)
+    SubElement(channel, "generator").text    = "GitHub Actions Scraper (thisismoney_mortgage)"
+
+    for item in items:
+        entry = SubElement(channel, "item")
+        SubElement(entry, "title").text   = item["title"]
+        SubElement(entry, "link").text    = item["link"]
+        guid_el = SubElement(entry, "guid")
+        guid_el.set("isPermaLink", "true")
+        guid_el.text                      = item["guid"]
+        SubElement(entry, "pubDate").text = item["pubDate"]
+        SubElement(entry, "author").text  = item["author"]
+        SubElement(entry, "description").text = item["content"]
+        ce = SubElement(entry, "content:encoded")
+        ce.text = item["content"]
+        for cat in item.get("categories", []):
+            SubElement(entry, "category").text = cat
+
+    raw    = tostring(rss, encoding="unicode")
+    pretty = minidom.parseString(raw).toprettyxml(indent="  ")
+    lines  = [l for l in pretty.split("\n") if l.strip() and not l.startswith("<?xml")]
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + "\n".join(lines)
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+
+def main():
+    os.makedirs("feeds", exist_ok=True)
+
+    log("=== This is Money Scraper START ===")
+
+    if not OPENROUTER_KEY:
+        log("ERROR: OPENROUTER_KEY not set. Exiting.")
+        return
+
+    seen           = load_seen()
+    existing_items = load_existing_items()
+    new_items      = []
+    author_idx     = len(existing_items) % len(AUTHORS)
+
+    log(f"Fetching RSS: {SOURCE_RSS}")
+    feed = feedparser.parse(SOURCE_RSS)
+    log(f"Found {len(feed.entries)} entries in RSS")
+
+    for entry in feed.entries:
+        if len(new_items) >= MAX_NEW_PER_RUN:
+            break
+
+        url   = entry.get("link", "").strip()
+        title = entry.get("title", "").strip()
+        h     = url_hash(url)
+
+        if h in seen:
+            log(f"  SKIP (seen): {title[:70]}")
+            continue
+
+        log(f"  PROCESS: {title[:70]}")
+
+        body_text = fetch_article_body(url)
+        if not body_text:
+            body_text = entry.get("summary", "")
+        if not body_text:
+            log("  No body text, skipping")
+            continue
+
+        author    = AUTHORS[author_idx % len(AUTHORS)]
+        rewritten = rewrite(title, body_text, author)
+
+        if not rewritten:
+            log("  Rewrite failed, skipping")
+            continue
+
+        slug     = slugify(title)
+        new_guid = f"{SITE_BASE_URL}/mortgage-news/{slug}-{h[:8]}/"
+        pub_date = entry.get("published", formatdate(localtime=False))
+
+        new_items.append({
+            "title":      title,
+            "link":       new_guid,
+            "guid":       new_guid,
+            "pubDate":    pub_date,
+            "content":    rewritten,
+            "author":     author,
+            "categories": ["Mortgages", "UK Housing", "This is Money"],
+        })
+
+        seen[h] = datetime.now().isoformat()
+        author_idx += 1
+        log(f"  OK — author: {author}")
+        time.sleep(2)
+
+    all_items = (new_items + existing_items)[:MAX_ITEMS]
+
+    xml_out = build_xml(all_items)
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+        f.write(xml_out)
+
+    save_seen(seen)
+    log(f"=== DONE — {len(new_items)} new / {len(all_items)} total ===")
+
+
+if __name__ == "__main__":
+    main()
