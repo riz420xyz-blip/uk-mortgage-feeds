@@ -3,7 +3,7 @@
 UK Mortgage Feed Scraper — Guardian Money
 For: bestmortgagesforyou.co.uk
 Output: feeds/thisismoney_mortgage.xml
-Target: 5 new articles per day
+Structure: mirrors medanaktual bansos feed format
 """
 
 import feedparser
@@ -31,8 +31,8 @@ FEED_LANG        = "en-gb"
 OUTPUT_PATH      = "feeds/thisismoney_mortgage.xml"
 HASH_FILE        = "feeds/.seen_thisismoney.json"
 
-MAX_ITEMS        = 20   # total items kept in feed
-MAX_NEW_PER_RUN  = 5    # 5 articles per day (cron runs once daily)
+MAX_ITEMS        = 20
+MAX_NEW_PER_RUN  = 5
 
 OPENROUTER_KEY   = os.environ.get("OPENROUTER_KEY", "")
 OPENROUTER_MODEL = "deepseek/deepseek-chat"
@@ -46,6 +46,9 @@ AUTHORS = [
 ]
 
 SITE_BASE_URL = "https://bestmortgagesforyou.co.uk"
+
+# Default featured image if none found
+DEFAULT_IMAGE = "https://bestmortgagesforyou.co.uk/wp-content/uploads/default-mortgage.jpg"
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 
@@ -66,6 +69,39 @@ def save_seen(seen: dict):
 
 def url_hash(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()
+
+# ─── IMAGE EXTRACTION ─────────────────────────────────────────────────────────
+
+def get_image_url(entry) -> str:
+    """Extract featured image URL from RSS entry."""
+    # Try media:content
+    if hasattr(entry, "media_content") and entry.media_content:
+        for m in entry.media_content:
+            url = m.get("url", "")
+            if url:
+                return url
+
+    # Try media:thumbnail
+    if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
+        url = entry.media_thumbnail[0].get("url", "")
+        if url:
+            return url
+
+    # Try enclosures
+    if hasattr(entry, "enclosures") and entry.enclosures:
+        for enc in entry.enclosures:
+            if "image" in enc.get("type", ""):
+                return enc.get("href", "")
+
+    # Try extracting from summary HTML
+    summary = entry.get("summary", "")
+    if summary:
+        soup = BeautifulSoup(summary, "lxml")
+        img = soup.find("img")
+        if img and img.get("src"):
+            return img["src"]
+
+    return DEFAULT_IMAGE
 
 # ─── ARTICLE FETCH ────────────────────────────────────────────────────────────
 
@@ -166,13 +202,28 @@ def slugify(text: str) -> str:
     s = re.sub(r"\s+", "-", s.strip())
     return s[:60].rstrip("-")
 
-def make_excerpt(html_content: str, max_chars: int = 200) -> str:
-    """Strip HTML and return plain text excerpt for <description>."""
-    soup = BeautifulSoup(html_content, "lxml")
-    text = soup.get_text(separator=" ", strip=True)
-    if len(text) > max_chars:
-        text = text[:max_chars].rsplit(" ", 1)[0] + "..."
-    return text
+def get_categories(title: str) -> list:
+    """Generate relevant category tags from article title."""
+    cats = ["Mortgages", "UK Housing", "Guardian Money"]
+    keywords = {
+        "interest rate": "Interest Rates",
+        "bank of england": "Bank of England",
+        "first-time buyer": "First Time Buyers",
+        "first time buyer": "First Time Buyers",
+        "house price": "House Prices",
+        "remortgage": "Remortgage",
+        "fixed rate": "Fixed Rate Mortgages",
+        "buy to let": "Buy to Let",
+        "help to buy": "Help to Buy",
+        "stamp duty": "Stamp Duty",
+        "savings": "Savings",
+        "inflation": "Inflation",
+    }
+    title_lower = title.lower()
+    for kw, cat in keywords.items():
+        if kw in title_lower and cat not in cats:
+            cats.append(cat)
+    return cats
 
 def load_existing_items() -> list:
     if not os.path.exists(OUTPUT_PATH):
@@ -189,20 +240,31 @@ def load_existing_items() -> list:
                 full_content = e.content[0].get("value", "")
             if not full_content:
                 full_content = e.get("summary", "")
+
+            # Try to get image from media
+            image_url = DEFAULT_IMAGE
+            if hasattr(e, "media_content") and e.media_content:
+                image_url = e.media_content[0].get("url", DEFAULT_IMAGE)
+
             items.append({
                 "title":      e.get("title", ""),
                 "link":       e.get("link", ""),
                 "guid":       e.get("id", e.get("link", "")),
                 "pubDate":    e.get("published", formatdate(localtime=False)),
-                "excerpt":    e.get("summary", ""),
                 "content":    full_content,
                 "author":     e.get("author", AUTHORS[0]),
                 "categories": tags,
+                "image_url":  image_url,
             })
         return items
     except Exception as e:
         log(f"  [load existing error] {e}")
         return []
+
+def wrap_with_image(html_content: str, image_url: str) -> str:
+    """Wrap article HTML with featured image — mirrors medanaktual structure."""
+    img_tag = f'<p><img src="{image_url}" style="max-width:100%;" /></p>'
+    return f'{img_tag}\n<div class="entry-content">\n{html_content}\n</div>'
 
 def build_xml(items: list) -> str:
     rss = Element("rss")
@@ -217,7 +279,7 @@ def build_xml(items: list) -> str:
     SubElement(channel, "description").text  = FEED_DESC
     SubElement(channel, "language").text     = FEED_LANG
     SubElement(channel, "lastBuildDate").text = formatdate(localtime=False)
-    SubElement(channel, "generator").text    = "GitHub Actions Scraper (thisismoney_mortgage)"
+    SubElement(channel, "generator").text    = "GitHub Actions Scraper (bestmortgages_uk)"
 
     for item in items:
         entry = SubElement(channel, "item")
@@ -229,15 +291,22 @@ def build_xml(items: list) -> str:
         SubElement(entry, "pubDate").text  = item["pubDate"]
         SubElement(entry, "author").text   = item["author"]
 
-        # <description> = short plain text excerpt (no HTML, no duplicate)
-        SubElement(entry, "description").text = item.get("excerpt", "")
-
-        # <content:encoded> = full HTML article only
+        # Full HTML in both description and content:encoded (like medanaktual)
+        full_html = wrap_with_image(item.get("content", ""), item.get("image_url", DEFAULT_IMAGE))
+        SubElement(entry, "description").text = full_html
         ce = SubElement(entry, "content:encoded")
-        ce.text = item.get("content", "")
+        ce.text = full_html
 
+        # Category tags
         for cat in item.get("categories", []):
             SubElement(entry, "category").text = cat
+
+        # media:content featured image
+        image_url = item.get("image_url", DEFAULT_IMAGE)
+        if image_url:
+            mc = SubElement(entry, "media:content")
+            mc.set("url", image_url)
+            mc.set("medium", "image")
 
     raw    = tostring(rss, encoding="unicode")
     pretty = minidom.parseString(raw).toprettyxml(indent="  ")
@@ -277,6 +346,11 @@ def main():
 
         log(f"  PROCESS: {title[:70]}")
 
+        # Get image
+        image_url = get_image_url(entry)
+        log(f"  Image: {image_url[:60]}")
+
+        # Get article body
         body_text = fetch_article_body(url)
         if not body_text:
             body_text = entry.get("summary", "")
@@ -294,17 +368,17 @@ def main():
         slug     = slugify(title)
         new_guid = f"{SITE_BASE_URL}/mortgage-news/{slug}-{h[:8]}/"
         pub_date = entry.get("published", formatdate(localtime=False))
-        excerpt  = make_excerpt(rewritten, 200)
+        cats     = get_categories(title)
 
         new_items.append({
             "title":      title,
             "link":       new_guid,
             "guid":       new_guid,
             "pubDate":    pub_date,
-            "excerpt":    excerpt,
             "content":    rewritten,
             "author":     author,
-            "categories": ["Mortgages", "UK Housing", "Guardian Money"],
+            "categories": cats,
+            "image_url":  image_url,
         })
 
         seen[h] = datetime.now().isoformat()
