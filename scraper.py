@@ -18,15 +18,15 @@ from bs4 import BeautifulSoup
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
 
-SOURCE_RSS    = "https://www.theguardian.com/money/mortgages/rss"
-FEED_TITLE    = "Best Mortgages For You – UK Mortgage News"
-FEED_LINK     = "https://bestmortgagesforyou.co.uk"
-FEED_DESC     = "Latest UK mortgage and housing finance news, sourced and rewritten daily."
-FEED_LANG     = "en-gb"
-OUTPUT_PATH   = "feeds/thisismoney_mortgage.xml"
-HASH_FILE     = "feeds/.seen_thisismoney.json"
-MAX_ITEMS     = 20
-MAX_NEW_PER_RUN = 5
+SOURCE_RSS       = "https://www.theguardian.com/money/mortgages/rss"
+FEED_TITLE       = "Best Mortgages For You – UK Mortgage News"
+FEED_LINK        = "https://bestmortgagesforyou.co.uk"
+FEED_DESC        = "Latest UK mortgage and housing finance news, sourced and rewritten daily."
+FEED_LANG        = "en-gb"
+OUTPUT_PATH      = "feeds/thisismoney_mortgage.xml"
+HASH_FILE        = "feeds/.seen_thisismoney.json"
+MAX_ITEMS        = 20
+MAX_NEW_PER_RUN  = 5
 OPENROUTER_KEY   = os.environ.get("OPENROUTER_KEY", "")
 OPENROUTER_MODEL = "deepseek/deepseek-chat"
 OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
@@ -56,29 +56,45 @@ def save_seen(seen):
 def url_hash(url):
     return hashlib.md5(url.encode()).hexdigest()
 
+def upgrade_image_url(url):
+    """Upgrade Guardian image URL from thumbnail to full size."""
+    if not url:
+        return url
+    url = re.sub(r'width=\d+', 'width=1200', url)
+    url = re.sub(r'quality=\d+', 'quality=85', url)
+    url = re.sub(r'fit=\w+', 'fit=max', url)
+    return url
+
 def get_image_url(entry):
+    """Extract and upgrade featured image URL from RSS entry."""
     if hasattr(entry, "media_content") and entry.media_content:
         for m in entry.media_content:
             if m.get("url"):
-                return m["url"]
+                return upgrade_image_url(m["url"])
+
     if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
         if entry.media_thumbnail[0].get("url"):
-            return entry.media_thumbnail[0]["url"]
+            return upgrade_image_url(entry.media_thumbnail[0]["url"])
+
     if hasattr(entry, "enclosures") and entry.enclosures:
         for enc in entry.enclosures:
             if "image" in enc.get("type", ""):
-                return enc.get("href", "")
+                return upgrade_image_url(enc.get("href", ""))
+
     summary = entry.get("summary", "")
     if summary:
         soup = BeautifulSoup(summary, "lxml")
         img = soup.find("img")
         if img and img.get("src"):
-            return img["src"]
+            return upgrade_image_url(img["src"])
+
     return DEFAULT_IMAGE
 
 def fetch_article_body(url):
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        }
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
@@ -196,16 +212,16 @@ def load_existing_items():
                 full_content = e.get("summary", "")
             image_url = DEFAULT_IMAGE
             if hasattr(e, "media_content") and e.media_content:
-                image_url = e.media_content[0].get("url", DEFAULT_IMAGE)
+                image_url = upgrade_image_url(e.media_content[0].get("url", DEFAULT_IMAGE))
             items.append({
-                "title": e.get("title", ""),
-                "link": e.get("link", ""),
-                "guid": e.get("id", e.get("link", "")),
-                "pubDate": e.get("published", formatdate(localtime=False)),
-                "content": full_content,
-                "author": e.get("author", AUTHORS[0]),
+                "title":      e.get("title", ""),
+                "link":       e.get("link", ""),
+                "guid":       e.get("id", e.get("link", "")),
+                "pubDate":    e.get("published", formatdate(localtime=False)),
+                "content":    full_content,
+                "author":     e.get("author", AUTHORS[0]),
                 "categories": tags,
-                "image_url": image_url,
+                "image_url":  image_url,
             })
         return items
     except Exception as e:
@@ -284,6 +300,7 @@ def main():
             continue
         log(f"  PROCESS: {title[:70]}")
         image_url = get_image_url(entry)
+        log(f"  Image: {image_url[:80]}")
         body_text = fetch_article_body(url)
         if not body_text:
             body_text = entry.get("summary", "")
@@ -299,14 +316,14 @@ def main():
         new_guid = f"{SITE_BASE_URL}/mortgage-news/{slug}-{h[:8]}/"
         pub_date = entry.get("published", formatdate(localtime=False))
         new_items.append({
-            "title": title,
-            "link": new_guid,
-            "guid": new_guid,
-            "pubDate": pub_date,
-            "content": rewritten,
-            "author": author,
+            "title":      title,
+            "link":       new_guid,
+            "guid":       new_guid,
+            "pubDate":    pub_date,
+            "content":    rewritten,
+            "author":     author,
             "categories": get_categories(title),
-            "image_url": image_url,
+            "image_url":  image_url,
         })
         seen[h] = datetime.now().isoformat()
         author_idx += 1
