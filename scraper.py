@@ -20,7 +20,7 @@ from xml.dom import minidom
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-SOURCE_RSS       = "https://www.thisismoney.co.uk/money/mortgages/index.rss"
+SOURCE_RSS       = "https://www.theguardian.com/money/mortgages/rss"
 
 FEED_TITLE       = "Best Mortgages For You – This is Money Updates"
 FEED_LINK        = "https://bestmortgagesforyou.co.uk"
