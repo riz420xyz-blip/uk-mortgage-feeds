@@ -189,7 +189,10 @@ def rewrite(title: str, body: str, author: str):
             timeout=60,
         )
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+        result = r.json()["choices"][0]["message"]["content"].strip()
+result = re.sub(r"^```html\s*", "", result)
+result = re.sub(r"```\s*$", "", result)
+return result.strip()
     except Exception as e:
         log(f"  [openrouter error] {e}")
         return None
